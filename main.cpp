@@ -36,7 +36,9 @@ extern "C"{
     #include <libavutil/samplefmt.h>
     #include <libavutil/timestamp.h>
     #include <libavformat/avformat.h>
+    #include <libavutil/fifo.h>
 }
+
 
 #include <string>
 #include <iostream>
@@ -157,8 +159,7 @@ static int decode_packet(AVCodecContext *dec, const AVPacket *pkt)
     return 0;
 }
 
-static int open_codec_context(int *stream_idx,
-                              AVCodecContext **dec_ctx, AVFormatContext *fmt_ctx, enum AVMediaType type)
+static int open_codec_context(int *stream_idx, AVCodecContext **dec_ctx, AVFormatContext *fmt_ctx, enum AVMediaType type)
 {
     int ret, stream_index;
     AVStream *st;
@@ -208,8 +209,7 @@ static int open_codec_context(int *stream_idx,
     return 0;
 }
 
-static int get_format_from_sample_fmt(const char **fmt,
-                                      enum AVSampleFormat sample_fmt)
+static int get_format_from_sample_fmt(const char **fmt,enum AVSampleFormat sample_fmt)
 {
     int i;
     struct sample_fmt_entry {
@@ -339,7 +339,13 @@ void demuxer_decode(){
             // skip it
             
 
-            out_st.write((const char*)pkt->data,pkt->size);
+            if (pkt->stream_index == video_stream_idx)
+                ret = decode_packet(video_dec_ctx, pkt);
+            else if (pkt->stream_index == audio_stream_idx)
+                ret = decode_packet(audio_dec_ctx, pkt);
+
+
+            //out_st.write((const char*)pkt->data,pkt->size);
             av_packet_unref(pkt);
             if (ret < 0)
                 break;
@@ -406,190 +412,218 @@ void demuxer_decode(){
 }
 
 
+int encode_video(){
 
-static void encode(AVCodecContext *enc_ctx, AVFrame *frame, AVPacket *pkt,
-FILE *outfile)
-{
-    int ret;
+    std::string filename("/home/liu/project/ffmpeglib/output.mp4");
+    std::string outname("/home/liu/project/ffmpeglib/output-en.mp4");
+	
 
-    /* send the frame to the encoder */
-    if (frame)
-        printf("Send frame %3"PRId64"\n", frame->pts);
+    AVFormatContext * format_ctx = nullptr;
+    AVCodecContext *dec_ctx = nullptr;
+    AVFrame *decoded_frame = nullptr;
+    AVPacket *pkt = nullptr;
+    AVPacket *outpkt = nullptr;
+    AVCodecParameters *codecPar = nullptr;
+    AVFormatContext *oc = nullptr;
+    const char *format = nullptr;
+    AVFifo *muxing_queue = nullptr;
+    AVFrame *filtered_frame = nullptr;
 
-    ret = avcodec_send_frame(enc_ctx, frame);
-    if (ret < 0) {
-        fprintf(stderr, "Error sending a frame for encoding\n");
-        exit(1);
-    }
+    format_ctx = avformat_alloc_context();
+    // format_ctx->data_codec_id = AV_CODEC_ID_NONE;
+    // format_ctx->video_codec_id = AV_CODEC_ID_NONE;
+    // format_ctx->audio_codec_id = AV_CODEC_ID_NONE;
+    // format_ctx->subtitle_codec_id = AV_CODEC_ID_NONE;
+    // format_ctx->flags |= AVFMT_FLAG_NONBLOCK;
 
-    while (ret >= 0) {
-        ret = avcodec_receive_packet(enc_ctx, pkt);
-        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
-            return;
-        else if (ret < 0) {
-            fprintf(stderr, "Error during encoding\n");
-            exit(1);
-        }
+    const AVInputFormat *file_iformat = NULL;
+    AVRational framerate_guessed;
 
-        printf("Write packet %3"PRId64" (size=%5d)\n", pkt->pts, pkt->size);
-        fwrite(pkt->data, 1, pkt->size, outfile);
-        av_packet_unref(pkt);
-    }
-}
+    int err = 0;
+    err = avformat_open_input(&format_ctx, filename.c_str(), NULL, NULL);
+    err = avformat_find_stream_info(format_ctx, NULL);
+    av_dump_format(format_ctx,0,filename.c_str(),0);
+    //avformat_new_stream()
 
-int encode_video()
-{
-    const char *filename, *codec_name;
-    const AVCodec *codec;
-    AVCodecContext *c= NULL;
-    int i, ret, x, y;
-    FILE *f;
-    AVFrame *frame;
-    AVPacket *pkt;
-    uint8_t endcode[] = { 0, 0, 1, 0xb7 };
 
-    std::string outvideo("out.mp4");
-    filename = outvideo.c_str();
-    codec_name = "libx264";
-
-    codec = avcodec_find_encoder_by_name(codec_name);
-    if (!codec) {
-        fprintf(stderr, "Codec '%s' not found\n", codec_name);
-        exit(1);
-    }
-
-    c = avcodec_alloc_context3(codec);
-    if (!c) {
-        fprintf(stderr, "Could not allocate video codec context\n");
-        exit(1);
-    }
-
+    const AVCodec *codec = avcodec_find_decoder(format_ctx->streams[0]->codecpar->codec_id);
+    dec_ctx = avcodec_alloc_context3(codec);
+    AVCodecParameters *par = format_ctx->streams[0]->codecpar;
+    err = avcodec_parameters_to_context(dec_ctx, par);
+    decoded_frame = av_frame_alloc();
     pkt = av_packet_alloc();
-    if (!pkt)
-        exit(1);
+    framerate_guessed = av_guess_frame_rate(format_ctx, format_ctx->streams[0], NULL);
+    codecPar = avcodec_parameters_alloc();
+    err = avcodec_parameters_from_context(codecPar,dec_ctx);
 
-    /* put sample parameters */
-    c->bit_rate = 400000;
-    /* resolution must be a multiple of two */
-    c->width = 352;
-    c->height = 288;
-    /* frames per second */
-    c->time_base = (AVRational){1, 25};
-    c->framerate = (AVRational){25, 1};
 
-    /* emit one intra frame every ten frames
-     * check frame pict_type before passing frame
-     * to encoder, if frame->pict_type is AV_PICTURE_TYPE_I
-     * then gop_size is ignored and the output of encoder
-     * will always be I frame irrespective to gop_size
-     */
-    c->gop_size = 10;
-    c->max_b_frames = 1;
-    c->pix_fmt = AV_PIX_FMT_YUV420P;
 
-    // if (codec->id == AV_CODEC_ID_H264)
-    //     av_opt_set(c->priv_data, "preset", "slow", 0);
-    //     av_set
+    err = avformat_alloc_output_context2(&oc, NULL, format, outname.c_str());
+    if (av_guess_codec(oc->oformat, NULL, oc->url, NULL, AVMEDIA_TYPE_VIDEO) == AV_CODEC_ID_NONE)
+        return -1;
 
-    /* open it */
-    ret = avcodec_open2(c, codec, NULL);
-    if (ret < 0) {
-        char buffer[AV_ERROR_MAX_STRING_SIZE]{0};
-        av_make_error_string(buffer, AV_ERROR_MAX_STRING_SIZE, ret);
-        fprintf(stderr, "Could not open codec: %s\n", buffer);
-        exit(1);
+    int qcr = avformat_query_codec(oc->oformat, oc->oformat->video_codec, 0);
+    AVStream *st = avformat_new_stream(oc, NULL);
+    muxing_queue = av_fifo_alloc2(8, sizeof(AVPacket*), 0);
+    filtered_frame = av_frame_alloc();
+    outpkt = av_packet_alloc();
+
+
+    err = avio_open2(&oc->pb, outname.c_str(), AVIO_FLAG_WRITE,&oc->interrupt_callback,NULL);
+
+    av_dict_copy(&oc->metadata, format_ctx->metadata,AV_DICT_DONT_OVERWRITE);
+    av_dict_set(&oc->metadata, "creation_time", NULL, 0);
+    av_dict_set(&oc->metadata, "company_name", NULL, 0);
+    av_dict_set(&oc->metadata, "product_name", NULL, 0);
+    av_dict_set(&oc->metadata, "product_version", NULL, 0);
+    av_dict_copy(&st->metadata, format_ctx->streams[0]->metadata, AV_DICT_DONT_OVERWRITE);
+
+    err = avformat_write_header(oc, NULL);
+
+    err = av_read_frame(format_ctx, outpkt);
+
+    
+
+    err = av_fifo_write(muxing_queue, outpkt, 1);
+
+
+    if(err!=0){
+        std::cerr<<"error"<<std::endl;
+        return -1;
+    
     }
-
-    f = fopen(filename, "wb");
-    if (!f) {
-        fprintf(stderr, "Could not open %s\n", filename);
-        exit(1);
-    }
-
-    frame = av_frame_alloc();
-    if (!frame) {
-        fprintf(stderr, "Could not allocate video frame\n");
-        exit(1);
-    }
-    frame->format = c->pix_fmt;
-    frame->width  = c->width;
-    frame->height = c->height;
-
-    ret = av_frame_get_buffer(frame, 0);
-    if (ret < 0) {
-        fprintf(stderr, "Could not allocate the video frame data\n");
-        exit(1);
-    }
-
-    /* encode 1 second of video */
-    for (i = 0; i < 25; i++) {
-        fflush(stdout);
-
-        /* Make sure the frame data is writable.
-           On the first round, the frame is fresh from av_frame_get_buffer()
-           and therefore we know it is writable.
-           But on the next rounds, encode() will have called
-           avcodec_send_frame(), and the codec may have kept a reference to
-           the frame in its internal structures, that makes the frame
-           unwritable.
-           av_frame_make_writable() checks that and allocates a new buffer
-           for the frame only if necessary.
-         */
-        ret = av_frame_make_writable(frame);
-        if (ret < 0)
-            exit(1);
-
-        /* Prepare a dummy image.
-           In real code, this is where you would have your own logic for
-           filling the frame. FFmpeg does not care what you put in the
-           frame.
-         */
-        /* Y */
-        for (y = 0; y < c->height; y++) {
-            for (x = 0; x < c->width; x++) {
-                frame->data[0][y * frame->linesize[0] + x] = x + y + i * 3;
-            }
-        }
-
-        /* Cb and Cr */
-        for (y = 0; y < c->height/2; y++) {
-            for (x = 0; x < c->width/2; x++) {
-                frame->data[1][y * frame->linesize[1] + x] = 128 + y + i * 2;
-                frame->data[2][y * frame->linesize[2] + x] = 64 + x + i * 5;
-            }
-        }
-
-        frame->pts = i;
-
-        /* encode the image */
-        encode(c, frame, pkt, f);
-    }
-
-    /* flush the encoder */
-    encode(c, NULL, pkt, f);
-
-    /* Add sequence end code to have a real MPEG file.
-       It makes only sense because this tiny examples writes packets
-       directly. This is called "elementary stream" and only works for some
-       codecs. To create a valid file, you usually need to write packets
-       into a proper file format or protocol; see muxing.c.
-     */
-    if (codec->id == AV_CODEC_ID_MPEG1VIDEO || codec->id == AV_CODEC_ID_MPEG2VIDEO)
-        fwrite(endcode, 1, sizeof(endcode), f);
-    fclose(f);
-
-    avcodec_free_context(&c);
-    av_frame_free(&frame);
+    av_frame_unref(decoded_frame);
     av_packet_free(&pkt);
+    
 
-    return 0;
+
+
+
+
+
+    try{
+        //const AVCodec *codec = avcodec_find_encoder(AVCodecID::AV_CODEC_ID_H264);
+        const AVCodec *codec = avcodec_find_encoder_by_name("libx264");
+        if(codec==nullptr){
+            throw std::runtime_error("codec find error");
+        }
+    }catch(std::exception &e){
+        std::cerr<<e.what()<<std::endl;
+
+    }
+    
+
 }
 
+
+void testYUV(){
+    std::string filename("/home/liu/project/ffmpeglib/output.mp4");
+    std::ifstream infile(filename,std::ios::binary);
+    std::ofstream outfile;
+    int yuv_size = 1920*1080*3/2;
+    unsigned char *buffer = new unsigned char[yuv_size];
+    for(int i=0;i<10;++i){
+        std::string outname = std::to_string(i)+".yuv";
+        outfile.open(outname,std::ios::binary);
+        infile.read((char*)buffer,yuv_size);
+        outfile.write((char*)buffer,yuv_size);
+        outfile.close();
+    }
+    delete[] buffer;
+
+
+}
+
+
+
+void testDemuxer(){
+    const char* inputFileUrl = "GK88_mpeg4.mp4";
+
+	//解封装
+	AVFormatContext* inputContext = nullptr;
+	avformat_open_input(&inputContext, inputFileUrl, NULL, NULL);
+	avformat_find_stream_info(inputContext, NULL);
+
+	//打印视频封装信息
+	av_dump_format(inputContext, 0, inputFileUrl,0);
+
+	//分离音频流和视频流
+	AVStream* audioInputStream = nullptr;
+	AVStream* videoInputStream = nullptr;
+
+	for (int i = 0; i < inputContext->nb_streams; i++)
+	{
+		if (inputContext->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+			audioInputStream = inputContext->streams[i];
+		else if (inputContext->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
+			videoInputStream = inputContext->streams[i];
+		else continue;
+	}
+
+	//重封装
+	const char* outputFileUrl = "test_output.mp4";
+	AVFormatContext* outputContext = nullptr;
+	//根据输出文件后缀推测封装格式
+	avformat_alloc_output_context2(&outputContext, NULL, NULL, outputFileUrl);
+	//添加音频流和视频流
+	AVStream* videoOutputStream = avformat_new_stream(outputContext, NULL);
+	//AVStream* audioOutputStream = avformat_new_stream(outputContext, NULL);
+	//打开IO流
+	avio_open(&outputContext->pb, outputFileUrl, AVIO_FLAG_WRITE);
+	//将输入视频流的封装配置复制至输出视频流
+	videoOutputStream->time_base = videoInputStream->time_base;
+	avcodec_parameters_copy(videoOutputStream->codecpar, videoInputStream->codecpar);
+	// //将输入音频流的封装配置复制至输出音频流
+	// audioOutputStream->time_base = audioInputStream->time_base;
+	// avcodec_parameters_copy(audioOutputStream->codecpar, audioInputStream->codecpar);
+	//写入文件头信息
+	avformat_write_header(outputContext, NULL);
+	av_dump_format(outputContext, 0, outputFileUrl, 1);
+
+	//读取输入流
+	AVPacket packet;
+    int frame_num = 0;
+    bool hasKey = false;
+	for (;;)
+	{
+		int result = av_read_frame(inputContext, &packet);
+		if (result != 0) break;
+        if(++frame_num<100) continue;
+        if(frame_num >= 10000) break;
+        if(!hasKey){
+            if(!(packet.flags&AV_PKT_FLAG_KEY)){
+                continue;
+            }else{
+                hasKey = true;
+            }
+        }
+        
+
+
+		if (packet.stream_index == videoOutputStream->index)
+		{
+			std::cout << "视频:";
+		}
+		// else if (packet.stream_index == audioOutputStream->index) {
+		// 	std::cout << "音频:";
+		// }
+		std::cout << packet.pts << " : " << packet.dts << " :" << packet.size <<std::endl;
+
+		av_interleaved_write_frame(outputContext, &packet);
+	}
+    std::cout<<"frame sum :"<<frame_num<<std::endl;
+	av_write_trailer(outputContext);
+	avformat_close_input(&inputContext);
+	avio_closep(&outputContext->pb);
+	avformat_free_context(outputContext);
+	outputContext = nullptr;
+}
 
 int main (int argc, char **argv)
 {
-    
+    //testYUV();
     //demuxer_decode();
-    encode_video();
+    //encode_video();
+    testDemuxer();
     return 0;
 }
